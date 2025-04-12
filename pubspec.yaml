@@ -69,6 +69,7 @@ flutter:
   assets:
     - yolo11n_saved_model/yolo11n_float16.tflite
     - yolo11n_saved_model/yolo11n_float32.tflite
+    - yolo11n_saved_model/assets/
   #   - images/a_dot_burr.jpeg
   #   - images/a_dot_ham.jpeg
 
