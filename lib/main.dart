@@ -102,13 +102,19 @@ class _MyHomePageState extends State<MyHomePage> {
     super.dispose();
   }
 
-  Future<void> testWithSampleImage() async {
+  // Future<void> testWithSampleImage() async {
+  //   try {
+  //     // Load a sample image from assets
+  //     final ByteData data = await rootBundle.load(
+  //       'yolo11n_saved_model/assets/test.jpg',
+  //     );
+
+  Future<void> testWithSampleImage(String imageFileUrl) async {
     try {
-      // Load a sample image from assets
-      final ByteData data = await rootBundle.load(
-        'yolo11n_saved_model/assets/test.jpg',
-      );
-      final List<int> bytes = data.buffer.asUint8List();
+      // Load image from the file path
+      final File imageFile = File(imageFileUrl);
+      // This returns Uint8List
+      final Uint8List bytes = await imageFile.readAsBytes();
 
       // Create a temporary file
       final tempDir = await getTemporaryDirectory();
@@ -147,9 +153,11 @@ class _MyHomePageState extends State<MyHomePage> {
 
       final File imageFile = File(picture.path);
 
-      // final detections = await runDetection(imageFile);
+      final detections = await runDetection(imageFile);
 
-      await testWithSampleImage();
+      // print('Test image detections: $detections');
+
+      await testWithSampleImage(picture.path);
     } catch (e) {
       print('Error taking picture: $e');
     }
