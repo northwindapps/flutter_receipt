@@ -3,15 +3,10 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'dart:io';
-import 'package:path_provider/path_provider.dart';
-import 'package:path/path.dart';
 import 'package:image/image.dart' as img;
-import 'package:permission_handler/permission_handler.dart';
 
-// https://app.outlier.ai/playground/67f9e004307fdd9ef659d0a9
 void main() {
   runApp(const MyApp());
 }
@@ -25,21 +20,6 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Flutter Demo',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
       home: const MyHomePage(title: 'Flutter Demo Home Page'),
@@ -72,7 +52,19 @@ class _MyHomePageState extends State<MyHomePage> {
   XFile? _capturedImage;
 
   Interpreter? _interpreter;
-  List<String>? _labels;
+  List<String> labels = [
+    'class0',
+    'class1',
+    'class2',
+    'class3',
+    'class4',
+    'class5',
+    'class6',
+    'class7',
+    'class8',
+    'class9',
+    // Change this labels as you need
+  ];
 
   // Model configurations
   final int inputSize =
@@ -105,40 +97,8 @@ class _MyHomePageState extends State<MyHomePage> {
     super.dispose();
   }
 
-  // Future<void> testWithSampleImage() async {
-  //   try {
-  //     // Load a sample image from assets
-  //     final ByteData data = await rootBundle.load(
-  //       'yolo11n_saved_model/assets/test.jpg',
-  //     );
-
-  Future<void> testWithSampleImage(String imageFileUrl) async {
-    try {
-      // Load image from the file path
-      final ByteData bytes = await rootBundle.load(
-        'yolo11n_saved_model/assets/test.jpg',
-      );
-      final List<int> list = bytes.buffer.asUint8List();
-
-      // Create a temporary file
-      final tempDir = await getTemporaryDirectory();
-      final tempFile = File('${tempDir.path}/test_byte.jpg');
-      await tempFile.writeAsBytes(list);
-
-      // Run detection
-      final detections = await runDetection(tempFile);
-
-      print('Test image detections: $detections');
-    } catch (e) {
-      print('Error testing with sample image: $e');
-    }
-  }
-
   Future<void> _takePicture() async {
     if (!_controller!.value.isInitialized) return;
-
-    final directory = await getTemporaryDirectory();
-    final String filePath = join(directory.path, '${DateTime.now()}.png');
 
     try {
       final XFile picture = await _controller!.takePicture();
@@ -155,104 +115,15 @@ class _MyHomePageState extends State<MyHomePage> {
 
       print('Picture saved to ${picture.path}');
 
-      // final File imageFile = File(picture.path);
+      final File imageFile = File(picture.path);
 
-      // final detections = await runDetection(imageFile);
+      final detections = await runDetection(imageFile);
 
-      // print('Test image detections: $detections');
+      print('Test image detections: $detections');
 
-      await testWithSampleImage(picture.path);
+      // await testWithSampleImage(picture.path);
     } catch (e) {
       print('Error taking picture: $e');
-    }
-  }
-
-  void inspectModelOutput(List<dynamic> output) {
-    try {
-      print('Detailed output inspection:');
-
-      // Check if output contains any non-zero values
-      bool hasNonZeroValues = false;
-      double maxValue = 0.0;
-      int maxValueRow = -1;
-      int maxValueCol = -1;
-
-      for (int i = 0; i < output[0].length; i++) {
-        for (int j = 0; j < output[0][i].length; j++) {
-          if (output[0][i][j] != 0) {
-            hasNonZeroValues = true;
-            if (output[0][i][j] > maxValue) {
-              maxValue = output[0][i][j];
-              maxValueRow = i;
-              maxValueCol = j;
-            }
-          }
-        }
-      }
-
-      print('  Has non-zero values: $hasNonZeroValues');
-      if (hasNonZeroValues) {
-        print(
-          '  Max value: $maxValue at position [$maxValueRow, $maxValueCol]',
-        );
-
-        // Print some values around the maximum
-        print('  Values around maximum:');
-        final startRow = math.max(0, maxValueRow - 2);
-        final endRow = math.min(output[0].length - 1, maxValueRow + 2);
-        final startCol = math.max(0, maxValueCol - 2);
-        final endCol = math.min(output[0][0].length - 1, maxValueCol + 2);
-
-        for (int i = startRow; i <= endRow; i++) {
-          String rowValues = '';
-          for (int j = startCol; j <= endCol; j++) {
-            rowValues += '${output[0][i][j].toStringAsFixed(4)} ';
-          }
-          print('    Row $i: $rowValues');
-        }
-      }
-
-      // Check first few detections
-      print('  First 5 potential detections:');
-      for (int i = 0; i < math.min(5, output[0][0].length); i++) {
-        // Get box coordinates
-        final x = output[0][0][i]; // center x
-        final y = output[0][1][i]; // center y
-        final w = output[0][2][i]; // width
-        final h = output[0][3][i]; // height
-
-        // Find max class probability
-        double maxClassProb = 0;
-        int maxClassIndex = -1;
-        for (int c = 0; c < output[0].length - 4; c++) {
-          if (output[0][c + 4][i] > maxClassProb) {
-            maxClassProb = output[0][c + 4][i];
-            maxClassIndex = c;
-          }
-        }
-
-        print(
-          '    Detection $i: box=[${x.toStringAsFixed(4)}, ${y.toStringAsFixed(4)}, ${w.toStringAsFixed(4)}, ${h.toStringAsFixed(4)}], class=$maxClassIndex, prob=${maxClassProb.toStringAsFixed(4)}',
-        );
-      }
-
-      // Check if there are any high confidence detections
-      int highConfCount = 0;
-      for (int i = 0; i < output[0][0].length; i++) {
-        double maxClassProb = 0;
-        for (int c = 0; c < output[0].length - 4; c++) {
-          if (output[0][c + 4][i] > maxClassProb) {
-            maxClassProb = output[0][c + 4][i];
-          }
-        }
-        if (maxClassProb > 0.1) {
-          // Lower threshold for debugging
-          highConfCount++;
-        }
-      }
-      print('  Detections with confidence > 0.1: $highConfCount');
-    } catch (e) {
-      print('Error in output inspection: $e');
     }
   }
 
@@ -305,9 +176,6 @@ class _MyHomePageState extends State<MyHomePage> {
       // Run inference
       _interpreter!.run(input, output);
 
-      // Inspect the output
-      //inspectModelOutput(output);
-
       // Process the output to get detection boxes
       final results = processOutput(output, image.width, image.height);
       if (results != []) {
@@ -318,8 +186,8 @@ class _MyHomePageState extends State<MyHomePage> {
         // If the box is relative to the original image, make sure it’s also resized
         final int x = box[0];
         final int y = box[1];
-        final int width = box[2]; // - box[0];
-        final int height = box[3]; // -box[1];
+        final int width = box[2];
+        final int height = box[3];
 
         // Optionally clamp (resizedImage has inputWidth x inputHeight dimensions)
         final cropped = img.copyCrop(
@@ -330,17 +198,8 @@ class _MyHomePageState extends State<MyHomePage> {
           height: height,
         );
 
-        // final cropped = resizedImage;
-
-        // Save as JPG
+        //Convert to JPG
         final jpg = img.encodeJpg(cropped);
-
-        final dir = await getApplicationDocumentsDirectory();
-        final file = File('${dir.path}/cropped_from_resized.jpg');
-        await file.writeAsBytes(jpg);
-
-        print('✅ Cropped image saved from resizedImage: ${file.path}');
-
         setState(() {
           _croppedImage = Uint8List.fromList(jpg);
         });
@@ -446,17 +305,6 @@ class _MyHomePageState extends State<MyHomePage> {
 
         // If class probability is good enough
         if (maxClassProb >= confidenceThreshold) {
-          // Convert normalized coordinates to actual pixel coordinates
-          // final xmin = ((x - w / 2) * imageWidth).round();
-          // final ymin = ((y - h / 2) * imageHeight).round();
-          // final xmax = ((x + w / 2) * imageWidth).round();
-          // final ymax = ((y + h / 2) * imageHeight).round();
-
-          // // Ensure coordinates are within image bounds
-          // final boundedXmin = math.max(0, xmin);
-          // final boundedYmin = math.max(0, ymin);
-          // final boundedXmax = math.min(imageWidth, xmax);
-          // final boundedYmax = math.min(imageHeight, ymax);
           final boundedXmin = (x * imageWidth).round();
           final boundedYmin = (y * imageHeight).round();
           final boundedXmax = (w * imageWidth).round();
@@ -468,11 +316,9 @@ class _MyHomePageState extends State<MyHomePage> {
               boundedYmax > 0 &&
               boundedYmin > 0) {
             detections.add({
-              'class': classIndex,
+              'index': classIndex,
               'className':
-                  _labels != null && classIndex < _labels!.length
-                      ? _labels![classIndex]
-                      : 'Unknown',
+                  classIndex < labels.length ? labels[classIndex] : 'Unknown',
               'confidence': maxClassProb,
               'box': [
                 boundedXmin.toInt(),
@@ -489,8 +335,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
       // Apply non-maximum suppression to remove overlapping boxes
       print('box' + detections.toString());
-      // final result = _nonMaxSuppression(detections, 0.5);
-      final result = detections;
+      final result = _nonMaxSuppression(detections, 0.5);
+      // final result = detections;
       print('Found ${result.length} detections after NMS');
 
       return result;
@@ -516,8 +362,10 @@ class _MyHomePageState extends State<MyHomePage> {
         if (suppressed[j]) continue;
 
         // Calculate IoU (Intersection over Union)
-        final iou = _calculateIoU(boxes[i]['box'], boxes[j]['box']);
-
+        final iou = _calculateIoU(
+          List<int>.from(boxes[i]['box']),
+          List<int>.from(boxes[j]['box']),
+        );
         if (iou >= threshold) {
           suppressed[j] = true;
         }
@@ -543,44 +391,6 @@ class _MyHomePageState extends State<MyHomePage> {
     final unionArea = boxAArea + boxBArea - interArea;
 
     return interArea / unionArea;
-  }
-
-  void checkHighConfidenceDetection(List<dynamic> output) {
-    try {
-      // Check the detection at position 8194 (where we found max value)
-      final i = 8194;
-
-      // Get bounding box coordinates
-      final x = output[0][0][i]; // center x
-      final y = output[0][1][i]; // center y
-      final w = output[0][2][i]; // width
-      final h = output[0][3][i]; // height
-
-      print('High confidence detection at index $i:');
-      print('  Box coordinates: x=$x, y=$y, w=$w, h=$h');
-
-      // Check class probabilities
-      print('  Class probabilities:');
-      List<double> classProbs = [];
-      for (int c = 0; c < 10; c++) {
-        // Just print first 10 classes
-        classProbs.add(output[0][c + 4][i]);
-      }
-      print('  First 10 classes: $classProbs');
-
-      // Find max class probability
-      double maxClassProb = 0;
-      int maxClassIndex = -1;
-      for (int c = 0; c < output[0].length - 4; c++) {
-        if (output[0][c + 4][i] > maxClassProb) {
-          maxClassProb = output[0][c + 4][i];
-          maxClassIndex = c;
-        }
-      }
-      print('  Max class: $maxClassIndex, probability: $maxClassProb');
-    } catch (e) {
-      print('Error checking high confidence detection: $e');
-    }
   }
 
   @override
