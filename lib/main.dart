@@ -107,21 +107,15 @@ class _MyHomePageState extends State<MyHomePage> {
       });
 
       // inference starts
-      final interpreter = await Interpreter.fromAsset(
+      _interpreter = await Interpreter.fromAsset(
         'yolo11n_saved_model/best_float32.tflite',
       );
-
-      _interpreter = interpreter;
 
       print('Picture saved to ${picture.path}');
 
       final File imageFile = File(picture.path);
 
       final detections = await runDetection(imageFile);
-
-      print('Test image detections: $detections');
-
-      // await testWithSampleImage(picture.path);
     } catch (e) {
       print('Error taking picture: $e');
     }
@@ -305,27 +299,19 @@ class _MyHomePageState extends State<MyHomePage> {
 
         // If class probability is good enough
         if (maxClassProb >= confidenceThreshold) {
-          final boundedXmin = (x * imageWidth).round();
-          final boundedYmin = (y * imageHeight).round();
-          final boundedXmax = (w * imageWidth).round();
-          final boundedYmax = (h * imageHeight).round();
+          final centerX = (x * imageWidth).round();
+          final centerY = (y * imageHeight).round();
+          final width = (w * imageWidth).round();
+          final height = (h * imageHeight).round();
 
           // Only add if the box has positive area
-          if (boundedXmax > 0 &&
-              boundedXmin > 0 &&
-              boundedYmax > 0 &&
-              boundedYmin > 0) {
+          if (centerX > 0 && centerY > 0 && width > 0 && height > 0) {
             detections.add({
               'index': classIndex,
               'className':
                   classIndex < labels.length ? labels[classIndex] : 'Unknown',
               'confidence': maxClassProb,
-              'box': [
-                boundedXmin.toInt(),
-                boundedYmin.toInt(),
-                boundedXmax.toInt(),
-                boundedYmax.toInt(),
-              ],
+              'box': [centerX, centerY, width, height],
             });
           }
         }
@@ -336,7 +322,6 @@ class _MyHomePageState extends State<MyHomePage> {
       // Apply non-maximum suppression to remove overlapping boxes
       print('box' + detections.toString());
       final result = _nonMaxSuppression(detections, 0.5);
-      // final result = detections;
       print('Found ${result.length} detections after NMS');
 
       return result;
@@ -428,7 +413,7 @@ class _MyHomePageState extends State<MyHomePage> {
               ),
               child: Image.memory(
                 _croppedImage!, // Uint8List of the cropped image
-                fit: BoxFit.cover,
+                fit: BoxFit.contain,
                 height: 300,
               ),
             ),
