@@ -7,6 +7,7 @@ plugins {
 
 android {
     namespace = "com.example.flutter_receipt"
+    testNamespace = "com.example.flutter_receipt"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 

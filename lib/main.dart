@@ -9,6 +9,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart';
 import 'package:image/image.dart' as img;
+import 'package:permission_handler/permission_handler.dart';
 
 // https://app.outlier.ai/playground/67f9e004307fdd9ef659d0a9
 void main() {
@@ -78,6 +79,8 @@ class _MyHomePageState extends State<MyHomePage> {
       416; // Common YOLO input size, adjust based on your model
   final double confidenceThreshold = 0.5;
 
+  Uint8List? _croppedImage;
+
   @override
   void initState() {
     super.initState();
@@ -112,14 +115,15 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> testWithSampleImage(String imageFileUrl) async {
     try {
       // Load image from the file path
-      final File imageFile = File(imageFileUrl);
-      // This returns Uint8List
-      final Uint8List bytes = await imageFile.readAsBytes();
+      final ByteData bytes = await rootBundle.load(
+        'yolo11n_saved_model/assets/test.jpg',
+      );
+      final List<int> list = bytes.buffer.asUint8List();
 
       // Create a temporary file
       final tempDir = await getTemporaryDirectory();
       final tempFile = File('${tempDir.path}/test_byte.jpg');
-      await tempFile.writeAsBytes(bytes);
+      await tempFile.writeAsBytes(list);
 
       // Run detection
       final detections = await runDetection(tempFile);
@@ -144,16 +148,16 @@ class _MyHomePageState extends State<MyHomePage> {
 
       // inference starts
       final interpreter = await Interpreter.fromAsset(
-        'yolo11n_saved_model/yolo11n_float32.tflite',
+        'yolo11n_saved_model/best_float32.tflite',
       );
 
       _interpreter = interpreter;
 
       print('Picture saved to ${picture.path}');
 
-      final File imageFile = File(picture.path);
+      // final File imageFile = File(picture.path);
 
-      final detections = await runDetection(imageFile);
+      // final detections = await runDetection(imageFile);
 
       // print('Test image detections: $detections');
 
@@ -306,9 +310,41 @@ class _MyHomePageState extends State<MyHomePage> {
 
       // Process the output to get detection boxes
       final results = processOutput(output, image.width, image.height);
+      if (results != []) {
+        print('Results: $results');
+        print('width' + image.width.toString());
+        print('height' + image.height.toString());
+        final box = List<int>.from(results[0]['box']);
+        // If the box is relative to the original image, make sure it’s also resized
+        final int x = box[0];
+        final int y = box[1];
+        final int width = box[2]; // - box[0];
+        final int height = box[3]; // -box[1];
 
-      print('Results: $results');
+        // Optionally clamp (resizedImage has inputWidth x inputHeight dimensions)
+        final cropped = img.copyCrop(
+          image,
+          x: (x - (width / 2)).toInt(),
+          y: (y - (height / 2)).toInt(),
+          width: width,
+          height: height,
+        );
 
+        // final cropped = resizedImage;
+
+        // Save as JPG
+        final jpg = img.encodeJpg(cropped);
+
+        final dir = await getApplicationDocumentsDirectory();
+        final file = File('${dir.path}/cropped_from_resized.jpg');
+        await file.writeAsBytes(jpg);
+
+        print('✅ Cropped image saved from resizedImage: ${file.path}');
+
+        setState(() {
+          _croppedImage = Uint8List.fromList(jpg);
+        });
+      }
       return results;
     } catch (e, stackTrace) {
       print('Error in runDetection: $e');
@@ -411,19 +447,26 @@ class _MyHomePageState extends State<MyHomePage> {
         // If class probability is good enough
         if (maxClassProb >= confidenceThreshold) {
           // Convert normalized coordinates to actual pixel coordinates
-          final xmin = ((x - w / 2) * imageWidth).round();
-          final ymin = ((y - h / 2) * imageHeight).round();
-          final xmax = ((x + w / 2) * imageWidth).round();
-          final ymax = ((y + h / 2) * imageHeight).round();
+          // final xmin = ((x - w / 2) * imageWidth).round();
+          // final ymin = ((y - h / 2) * imageHeight).round();
+          // final xmax = ((x + w / 2) * imageWidth).round();
+          // final ymax = ((y + h / 2) * imageHeight).round();
 
-          // Ensure coordinates are within image bounds
-          final boundedXmin = math.max(0, xmin);
-          final boundedYmin = math.max(0, ymin);
-          final boundedXmax = math.min(imageWidth, xmax);
-          final boundedYmax = math.min(imageHeight, ymax);
+          // // Ensure coordinates are within image bounds
+          // final boundedXmin = math.max(0, xmin);
+          // final boundedYmin = math.max(0, ymin);
+          // final boundedXmax = math.min(imageWidth, xmax);
+          // final boundedYmax = math.min(imageHeight, ymax);
+          final boundedXmin = (x * imageWidth).round();
+          final boundedYmin = (y * imageHeight).round();
+          final boundedXmax = (w * imageWidth).round();
+          final boundedYmax = (h * imageHeight).round();
 
           // Only add if the box has positive area
-          if (boundedXmax > boundedXmin && boundedYmax > boundedYmin) {
+          if (boundedXmax > 0 &&
+              boundedXmin > 0 &&
+              boundedYmax > 0 &&
+              boundedYmin > 0) {
             detections.add({
               'class': classIndex,
               'className':
@@ -431,7 +474,12 @@ class _MyHomePageState extends State<MyHomePage> {
                       ? _labels![classIndex]
                       : 'Unknown',
               'confidence': maxClassProb,
-              'box': [boundedXmin, boundedYmin, boundedXmax, boundedYmax],
+              'box': [
+                boundedXmin.toInt(),
+                boundedYmin.toInt(),
+                boundedXmax.toInt(),
+                boundedYmax.toInt(),
+              ],
             });
           }
         }
@@ -440,7 +488,9 @@ class _MyHomePageState extends State<MyHomePage> {
       print('Found ${detections.length} detections before NMS');
 
       // Apply non-maximum suppression to remove overlapping boxes
-      final result = _nonMaxSuppression(detections, 0.5);
+      print('box' + detections.toString());
+      // final result = _nonMaxSuppression(detections, 0.5);
+      final result = detections;
       print('Found ${result.length} detections after NMS');
 
       return result;
@@ -555,6 +605,23 @@ class _MyHomePageState extends State<MyHomePage> {
               label: const Text('Take Picture'),
             ),
           ),
+
+          // Captured and Cropped Image Display
+          if (_croppedImage != null)
+            Container(
+              height: 300,
+              width: double.infinity,
+              margin: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Image.memory(
+                _croppedImage!, // Uint8List of the cropped image
+                fit: BoxFit.cover,
+                height: 300,
+              ),
+            ),
         ],
       ),
     );
