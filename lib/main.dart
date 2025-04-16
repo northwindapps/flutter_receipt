@@ -71,7 +71,8 @@ class _MyHomePageState extends State<MyHomePage> {
       416; // Common YOLO input size, adjust based on your model
   final double confidenceThreshold = 0.5;
 
-  Uint8List? _croppedImage;
+  // Uint8List? _croppedImage;
+  List<Uint8List>? _croppedImages;
 
   @override
   void initState() {
@@ -104,6 +105,7 @@ class _MyHomePageState extends State<MyHomePage> {
       final XFile picture = await _controller!.takePicture();
       setState(() {
         _capturedImage = picture;
+        _croppedImages = [];
       });
 
       // inference starts
@@ -172,32 +174,37 @@ class _MyHomePageState extends State<MyHomePage> {
 
       // Process the output to get detection boxes
       final results = processOutput(output, image.width, image.height);
-      if (results != []) {
+      if (results.isNotEmpty) {
         print('Results: $results');
-        print('width' + image.width.toString());
-        print('height' + image.height.toString());
-        final box = List<int>.from(results[0]['box']);
-        // If the box is relative to the original image, make sure it’s also resized
-        final int x = box[0];
-        final int y = box[1];
-        final int width = box[2];
-        final int height = box[3];
+        print('width: ${image.width}');
+        print('height: ${image.height}');
 
-        // Optionally clamp (resizedImage has inputWidth x inputHeight dimensions)
-        final cropped = img.copyCrop(
-          image,
-          x: (x - (width / 2)).toInt(),
-          y: (y - (height / 2)).toInt(),
-          width: width,
-          height: height,
-        );
+        for (final result in results) {
+          final box = List<int>.from(result['box']);
+          final int x = box[0];
+          final int y = box[1];
+          final int width = box[2];
+          final int height = box[3];
 
-        //Convert to JPG
-        final jpg = img.encodeJpg(cropped);
-        setState(() {
-          _croppedImage = Uint8List.fromList(jpg);
-        });
+          // Crop with center offset (YOLO style)
+          final cropped = img.copyCrop(
+            image,
+            x: (x - (width / 2)).toInt().clamp(0, image.width - 1),
+            y: (y - (height / 2)).toInt().clamp(0, image.height - 1),
+            width: width,
+            height: height,
+          );
+
+          // Convert to JPG
+          final jpg = img.encodeJpg(cropped);
+          final newImage = Uint8List.fromList(jpg);
+
+          setState(() {
+            _croppedImages!.add(newImage);
+          });
+        }
       }
+
       return results;
     } catch (e, stackTrace) {
       print('Error in runDetection: $e');
@@ -390,8 +397,6 @@ class _MyHomePageState extends State<MyHomePage> {
                     ? CameraPreview(_controller!)
                     : const Center(child: CircularProgressIndicator()),
           ),
-          if (_capturedImage != null)
-            Image.file(File(_capturedImage!.path), height: 150),
           Padding(
             padding: const EdgeInsets.all(8.0),
             child: ElevatedButton.icon(
@@ -400,23 +405,31 @@ class _MyHomePageState extends State<MyHomePage> {
               label: const Text('Take Picture'),
             ),
           ),
-
           // Captured and Cropped Image Display
-          if (_croppedImage != null)
-            Container(
-              height: 300,
-              width: double.infinity,
-              margin: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.grey),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Image.memory(
-                _croppedImage!, // Uint8List of the cropped image
-                fit: BoxFit.contain,
-                height: 300,
-              ),
-            ),
+          _croppedImages != null && _croppedImages!.isNotEmpty
+              ? SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.all(10),
+                child: Row(
+                  children:
+                      _croppedImages!.map((image) {
+                        return Container(
+                          margin: const EdgeInsets.only(right: 10),
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.grey),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Image.memory(
+                            image,
+                            width: 150,
+                            height: 150,
+                            fit: BoxFit.cover,
+                          ),
+                        );
+                      }).toList(),
+                ),
+              )
+              : SizedBox.shrink(),
         ],
       ),
     );
