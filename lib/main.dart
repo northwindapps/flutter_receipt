@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 
 import 'detector.dart';
+import 'tracker.dart';
 
 void main() {
   runApp(const MyApp());
@@ -61,6 +62,7 @@ class _MyHomePageState extends State<MyHomePage> {
   bool _live = true;
   bool _frameInFlight = false;
   FrameDetections? _liveDetections;
+  final DetectionTracker _tracker = DetectionTracker();
   final Stopwatch _frameClock = Stopwatch();
   double _liveFps = 0;
 
@@ -111,6 +113,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _live = live;
       _liveDetections = null;
     });
+    _tracker.clear();
     live ? await _startLive() : await _stopLive();
   }
 
@@ -125,8 +128,13 @@ class _MyHomePageState extends State<MyHomePage> {
           if (!mounted || !_live) return;
           final elapsed = _frameClock.elapsedMilliseconds;
           _frameClock.reset();
+          // Boxes from a differently rotated frame can't be matched.
+          if (result.frameSize != _liveDetections?.frameSize) _tracker.clear();
           setState(() {
-            _liveDetections = result;
+            _liveDetections = FrameDetections(
+              result.frameSize,
+              _tracker.update(result.detections),
+            );
             _liveFps = elapsed > 0 ? 1000 / elapsed : 0;
           });
         }, onError: (Object e) => print('Live detection error: $e'))

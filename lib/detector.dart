@@ -13,6 +13,10 @@ const _modelAsset = 'yolo11n_saved_model/best_float32.tflite';
 // Class names from the Ultralytics metadata embedded in the model file.
 const detectionLabels = ['datechar', 'datesla', 'item', 'itemv', 'totals', 'tv'];
 
+// The worker keeps boxes down to this confidence, so live tracking can keep
+// showing a box whose score dips for a frame. Callers apply their own cut-off.
+const minWorkerConfidence = 0.25;
+
 // Each detection travels between isolates as 6 floats:
 // class, confidence, left, top, right, bottom (box normalized to 0-1).
 const _fieldsPerDetection = 6;
@@ -61,12 +65,13 @@ class FrameDetections {
 /// Runs the YOLO model in a background isolate that keeps the interpreter
 /// loaded, so the UI thread never blocks on model loading or inference.
 class Detector {
-  Detector._(this._isolate, this._worker, this._inputWidth, this._inputHeight);
+  Detector._(this._isolate, this._worker, this.confidenceThreshold);
 
   final Isolate _isolate;
   final SendPort _worker;
-  final int _inputWidth;
-  final int _inputHeight;
+
+  /// Minimum confidence for detections returned by [detect].
+  final double confidenceThreshold;
 
   static Future<Detector> load({
     double confidenceThreshold = 0.5,
@@ -83,7 +88,6 @@ class Detector {
     final isolate = await Isolate.spawn(_workerMain, (
       ready.sendPort,
       TransferableTypedData.fromList([modelBytes]),
-      confidenceThreshold,
       iouThreshold,
     ), debugName: 'yolo-detector');
     final message = await ready.first;
@@ -98,24 +102,16 @@ class Detector {
       'Detector ready in ${stopwatch.elapsedMilliseconds} ms '
       '(input ${width}x$height)',
     );
-    return Detector._(isolate, port, width, height);
+    return Detector._(isolate, port, confidenceThreshold);
   }
 
   Future<DetectionResult> detect(String imagePath) async {
     final total = Stopwatch()..start();
     final bytes = await File(imagePath).readAsBytes();
 
-    // Flutter's native decoders do the JPEG decode and the resize to the
-    // model's input size, instead of the much slower pure-Dart decoder.
-    final (image, modelInput) =
-        await (
-          _decode(bytes),
-          _decode(bytes, width: _inputWidth, height: _inputHeight),
-        ).wait;
-    final rgba = await modelInput.toByteData(
-      format: ui.ImageByteFormat.rawRgba,
-    );
-    modelInput.dispose();
+    // Flutter's native decoder is much faster than the pure-Dart one.
+    final image = await _decode(bytes);
+    final rgba = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
     final decodeMs = total.elapsedMilliseconds;
 
     final _WorkerResult result;
@@ -125,17 +121,18 @@ class Detector {
           TransferableTypedData.fromList([
             rgba!.buffer.asUint8List(rgba.offsetInBytes, rgba.lengthInBytes),
           ]),
-        ], _inputWidth, _inputHeight),
+        ], image.width, image.height, rowStride: image.width * 4),
       );
     } catch (_) {
       image.dispose();
       rethrow;
     }
     final (boxes, preprocessMs, inferenceMs, postprocessMs) = result;
-    final detections = _toDetections(
-      boxes,
-      ui.Size(image.width.toDouble(), image.height.toDouble()),
-    );
+    final detections =
+        _toDetections(
+          boxes,
+          ui.Size(image.width.toDouble(), image.height.toDouble()),
+        ).where((d) => d.confidence >= confidenceThreshold).toList();
 
     debugPrint(
       'Detection: decode $decodeMs ms, preprocess $preprocessMs ms, '
@@ -147,7 +144,8 @@ class Detector {
   }
 
   /// Detects objects in a camera stream frame. [rotation] is the clockwise
-  /// rotation in degrees that makes the frame upright.
+  /// rotation in degrees that makes the frame upright. Returns detections down
+  /// to [minWorkerConfidence]; filter or track them before showing.
   ///
   /// The frame's bytes are copied before this method first awaits, so the
   /// caller may let the camera reuse the buffer right after calling it.
@@ -226,16 +224,8 @@ class Detector {
     _isolate.kill();
   }
 
-  static Future<ui.Image> _decode(
-    Uint8List bytes, {
-    int? width,
-    int? height,
-  }) async {
-    final codec = await ui.instantiateImageCodec(
-      bytes,
-      targetWidth: width,
-      targetHeight: height,
-    );
+  static Future<ui.Image> _decode(Uint8List bytes) async {
+    final codec = await ui.instantiateImageCodec(bytes);
     final frame = await codec.getNextFrame();
     codec.dispose();
     return frame.image;
@@ -244,8 +234,8 @@ class Detector {
 
 enum _Format { rgba, yuv420, bgra8888 }
 
-/// Pixels sent to the worker. `rgba` is already resized to the model input;
-/// camera frames are converted, rotated and resized in the worker.
+/// Pixels sent to the worker, which converts, rotates and letterboxes them
+/// into the model input.
 class _Request {
   _Request(
     this.format,
@@ -271,8 +261,8 @@ class _Request {
 /// Detections, then preprocess, inference and postprocess times in ms.
 typedef _WorkerResult = (Float32List, int, int, int);
 
-void _workerMain((SendPort, TransferableTypedData, double, double) args) {
-  final (ready, modelData, confidenceThreshold, iouThreshold) = args;
+void _workerMain((SendPort, TransferableTypedData, double) args) {
+  final (ready, modelData, iouThreshold) = args;
 
   final Interpreter interpreter;
   try {
@@ -301,7 +291,12 @@ void _workerMain((SendPort, TransferableTypedData, double, double) args) {
     final (request, reply) = message as (_Request, SendPort);
     try {
       final stopwatch = Stopwatch()..start();
-      _fillInput(request, input, inputShape[2], inputShape[1]);
+      final letterbox = _fillInput(
+        request,
+        input,
+        inputShape[2],
+        inputShape[1],
+      );
       // Write straight into the tensor's memory instead of nested lists.
       interpreter.getInputTensor(0).data = input.buffer.asUint8List();
       final preprocessMs = stopwatch.elapsedMilliseconds;
@@ -320,9 +315,10 @@ void _workerMain((SendPort, TransferableTypedData, double, double) args) {
         output,
         outputShape[1],
         outputShape[2],
-        confidenceThreshold,
+        minWorkerConfidence,
         iouThreshold,
       );
+      letterbox.toFrame(boxes);
       reply.send((
         boxes,
         preprocessMs,
@@ -335,33 +331,62 @@ void _workerMain((SendPort, TransferableTypedData, double, double) args) {
   });
 }
 
-/// Writes [request]'s pixels into [input] as normalized RGB floats of size
-/// [outWidth] x [outHeight], rotating and resizing camera frames on the way.
-void _fillInput(_Request request, Float32List input, int outWidth, int outHeight) {
-  final planes = [for (final p in request.planes) p.materialize().asUint8List()];
+/// Where the upright image landed inside the model input.
+class _Letterbox {
+  _Letterbox(
+    this.scale,
+    this.padX,
+    this.padY,
+    this.inputWidth,
+    this.inputHeight,
+    this.imageWidth,
+    this.imageHeight,
+  );
 
-  if (request.format == _Format.rgba) {
-    final rgba = planes[0];
-    for (var p = 0, i = 0; p < rgba.length; p += 4) {
-      input[i++] = rgba[p] / 255.0;
-      input[i++] = rgba[p + 1] / 255.0;
-      input[i++] = rgba[p + 2] / 255.0;
+  final double scale;
+  final int padX, padY, inputWidth, inputHeight, imageWidth, imageHeight;
+
+  /// Converts box coordinates in [boxes] from normalized model-input space to
+  /// normalized image space, in place.
+  void toFrame(Float32List boxes) {
+    for (var i = 0; i < boxes.length; i += _fieldsPerDetection) {
+      boxes[i + 2] = (boxes[i + 2] * inputWidth - padX) / scale / imageWidth;
+      boxes[i + 3] = (boxes[i + 3] * inputHeight - padY) / scale / imageHeight;
+      boxes[i + 4] = (boxes[i + 4] * inputWidth - padX) / scale / imageWidth;
+      boxes[i + 5] = (boxes[i + 5] * inputHeight - padY) / scale / imageHeight;
     }
-    return;
   }
+}
 
+/// Writes [request]'s pixels into [input] as normalized RGB floats of size
+/// [outWidth] x [outHeight]: rotated upright, scaled to fit while keeping the
+/// aspect ratio, and padded with gray, like Ultralytics' letterbox.
+_Letterbox _fillInput(
+  _Request request,
+  Float32List input,
+  int outWidth,
+  int outHeight,
+) {
+  final planes = [for (final p in request.planes) p.materialize().asUint8List()];
   final w = request.width;
   final h = request.height;
   final rotation = request.rotation % 360;
   final uprightWidth = rotation % 180 == 0 ? w : h;
   final uprightHeight = rotation % 180 == 0 ? h : w;
 
-  var i = 0;
-  for (var oy = 0; oy < outHeight; oy++) {
-    final uy = oy * uprightHeight ~/ outHeight;
-    for (var ox = 0; ox < outWidth; ox++) {
-      final ux = ox * uprightWidth ~/ outWidth;
-      // Map the upright pixel back to the sensor-oriented frame.
+  final scale = math.min(outWidth / uprightWidth, outHeight / uprightHeight);
+  final scaledWidth = math.min(outWidth, (uprightWidth * scale).round());
+  final scaledHeight = math.min(outHeight, (uprightHeight * scale).round());
+  final padX = (outWidth - scaledWidth) ~/ 2;
+  final padY = (outHeight - scaledHeight) ~/ 2;
+  input.fillRange(0, input.length, 114 / 255.0);
+
+  for (var oy = 0; oy < scaledHeight; oy++) {
+    final uy = math.min(uprightHeight - 1, (oy / scale).floor());
+    var i = ((oy + padY) * outWidth + padX) * 3;
+    for (var ox = 0; ox < scaledWidth; ox++) {
+      final ux = math.min(uprightWidth - 1, (ox / scale).floor());
+      // Map the upright pixel back to the source's orientation.
       final int sx, sy;
       switch (rotation) {
         case 90:
@@ -379,26 +404,42 @@ void _fillInput(_Request request, Float32List input, int outWidth, int outHeight
       }
 
       double r, g, b;
-      if (request.format == _Format.yuv420) {
-        final y = planes[0][sy * request.rowStride + sx];
-        final uvIndex =
-            (sy >> 1) * request.uvRowStride + (sx >> 1) * request.uvPixelStride;
-        final u = planes[1][uvIndex] - 128;
-        final v = planes[2][uvIndex] - 128;
-        r = y + 1.402 * v;
-        g = y - 0.344136 * u - 0.714136 * v;
-        b = y + 1.772 * u;
-      } else {
-        final p = sy * request.rowStride + sx * 4;
-        b = planes[0][p].toDouble();
-        g = planes[0][p + 1].toDouble();
-        r = planes[0][p + 2].toDouble();
+      switch (request.format) {
+        case _Format.yuv420:
+          final y = planes[0][sy * request.rowStride + sx];
+          final uvIndex =
+              (sy >> 1) * request.uvRowStride +
+              (sx >> 1) * request.uvPixelStride;
+          final u = planes[1][uvIndex] - 128;
+          final v = planes[2][uvIndex] - 128;
+          r = y + 1.402 * v;
+          g = y - 0.344136 * u - 0.714136 * v;
+          b = y + 1.772 * u;
+        case _Format.bgra8888:
+          final p = sy * request.rowStride + sx * 4;
+          b = planes[0][p].toDouble();
+          g = planes[0][p + 1].toDouble();
+          r = planes[0][p + 2].toDouble();
+        case _Format.rgba:
+          final p = sy * request.rowStride + sx * 4;
+          r = planes[0][p].toDouble();
+          g = planes[0][p + 1].toDouble();
+          b = planes[0][p + 2].toDouble();
       }
       input[i++] = r.clamp(0, 255) / 255.0;
       input[i++] = g.clamp(0, 255) / 255.0;
       input[i++] = b.clamp(0, 255) / 255.0;
     }
   }
+  return _Letterbox(
+    scale,
+    padX,
+    padY,
+    outWidth,
+    outHeight,
+    uprightWidth,
+    uprightHeight,
+  );
 }
 
 Interpreter _createInterpreter(Uint8List model) {
