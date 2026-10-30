@@ -15,6 +15,16 @@ subprojects {
 subprojects {
     project.evaluationDependsOn(":app")
 }
+// tflite_flutter 0.11.0 targets Java 1.8 but leaves Kotlin's jvmTarget unset; align them.
+subprojects {
+    if (project.name == "tflite_flutter") {
+        plugins.withId("org.jetbrains.kotlin.android") {
+            tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+                compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+            }
+        }
+    }
+}
 
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
