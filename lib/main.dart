@@ -1,6 +1,8 @@
+import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 
 import 'detector.dart';
@@ -50,18 +52,34 @@ class _MyHomePageState extends State<MyHomePage> {
 
   // The model is loaded once, in the background, while the camera starts.
   final Future<Detector> _detector = Detector.load();
+  Detector? _loadedDetector;
   bool _isDetecting = false;
   DetectionResult? _result;
+
+  // Live detection on the camera stream. Only one frame is processed at a
+  // time; frames arriving meanwhile are dropped.
+  bool _live = true;
+  bool _frameInFlight = false;
+  FrameDetections? _liveDetections;
+  final Stopwatch _frameClock = Stopwatch();
+  double _liveFps = 0;
 
   @override
   void initState() {
     super.initState();
+    _detector.then((detector) => _loadedDetector = detector);
     _initCamera();
   }
 
   Future<void> _initCamera() async {
     _cameras = await availableCameras();
-    _controller = CameraController(_cameras[0], ResolutionPreset.medium);
+    _controller = CameraController(
+      _cameras[0],
+      ResolutionPreset.medium,
+      enableAudio: false,
+      imageFormatGroup:
+          Platform.isIOS ? ImageFormatGroup.bgra8888 : ImageFormatGroup.yuv420,
+    );
 
     await _controller!.initialize();
 
@@ -69,6 +87,66 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _isCameraInitialized = true;
     });
+    if (_live) await _startLive();
+  }
+
+  Future<void> _startLive() async {
+    final controller = _controller;
+    if (controller == null || controller.value.isStreamingImages) return;
+    _frameClock
+      ..reset()
+      ..start();
+    await controller.startImageStream(_onFrame);
+  }
+
+  Future<void> _stopLive() async {
+    final controller = _controller;
+    if (controller != null && controller.value.isStreamingImages) {
+      await controller.stopImageStream();
+    }
+  }
+
+  Future<void> _setLive(bool live) async {
+    setState(() {
+      _live = live;
+      _liveDetections = null;
+    });
+    live ? await _startLive() : await _stopLive();
+  }
+
+  void _onFrame(CameraImage frame) {
+    final detector = _loadedDetector;
+    if (detector == null || _frameInFlight || _isDetecting) return;
+
+    _frameInFlight = true;
+    detector
+        .detectFrame(frame, _frameRotation())
+        .then((result) {
+          if (!mounted || !_live) return;
+          final elapsed = _frameClock.elapsedMilliseconds;
+          _frameClock.reset();
+          setState(() {
+            _liveDetections = result;
+            _liveFps = elapsed > 0 ? 1000 / elapsed : 0;
+          });
+        }, onError: (Object e) => print('Live detection error: $e'))
+        .whenComplete(() => _frameInFlight = false);
+  }
+
+  /// Clockwise rotation that makes a stream frame match the screen.
+  int _frameRotation() {
+    final controller = _controller!;
+    const deviceDegrees = {
+      DeviceOrientation.portraitUp: 0,
+      DeviceOrientation.landscapeLeft: 90,
+      DeviceOrientation.portraitDown: 180,
+      DeviceOrientation.landscapeRight: 270,
+    };
+    final device = deviceDegrees[controller.value.deviceOrientation]!;
+    final sensor = controller.description.sensorOrientation;
+    return controller.description.lensDirection == CameraLensDirection.front
+        ? (sensor + device) % 360
+        : (sensor - device + 360) % 360;
   }
 
   @override
@@ -84,6 +162,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
     setState(() => _isDetecting = true);
     try {
+      // Pause the frame stream so the capture gets the camera to itself.
+      await _stopLive();
       final XFile picture = await _controller!.takePicture();
       print('Picture saved to ${picture.path}');
 
@@ -101,7 +181,10 @@ class _MyHomePageState extends State<MyHomePage> {
     } catch (e) {
       print('Error taking picture: $e');
     } finally {
-      if (mounted) setState(() => _isDetecting = false);
+      if (mounted) {
+        setState(() => _isDetecting = false);
+        if (_live) await _startLive();
+      }
     }
   }
 
@@ -109,13 +192,33 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget build(BuildContext context) {
     final result = _result;
     return Scaffold(
-      appBar: AppBar(title: Text(widget.title)),
+      appBar: AppBar(
+        title: Text(widget.title),
+        actions: [
+          const Text('Live'),
+          Switch(value: _live, onChanged: _setLive),
+        ],
+      ),
       body: Column(
         children: [
           Expanded(
             child:
                 _isCameraInitialized
-                    ? CameraPreview(_controller!)
+                    ? CameraPreview(
+                      _controller!,
+                      child:
+                          _live && _liveDetections != null
+                              ? CustomPaint(
+                                painter: _BoxesPainter(
+                                  _liveDetections!,
+                                  fps: _liveFps,
+                                  mirror:
+                                      _controller!.description.lensDirection ==
+                                      CameraLensDirection.front,
+                                ),
+                              )
+                              : null,
+                    )
                     : const Center(child: CircularProgressIndicator()),
           ),
           Padding(
@@ -203,4 +306,75 @@ class _CropPainter extends CustomPainter {
   @override
   bool shouldRepaint(_CropPainter oldDelegate) =>
       image != oldDelegate.image || region != oldDelegate.region;
+}
+
+/// Draws live detections over the camera preview.
+class _BoxesPainter extends CustomPainter {
+  _BoxesPainter(this.result, {required this.fps, required this.mirror});
+
+  final FrameDetections result;
+  final double fps;
+  final bool mirror;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final scaleX = size.width / result.frameSize.width;
+    final scaleY = size.height / result.frameSize.height;
+
+    for (final detection in result.detections) {
+      var rect = Rect.fromLTRB(
+        detection.box.left * scaleX,
+        detection.box.top * scaleY,
+        detection.box.right * scaleX,
+        detection.box.bottom * scaleY,
+      );
+      if (mirror) {
+        rect = Rect.fromLTRB(
+          size.width - rect.right,
+          rect.top,
+          size.width - rect.left,
+          rect.bottom,
+        );
+      }
+      final color =
+          Colors.primaries[detection.classIndex * 3 % Colors.primaries.length];
+      canvas.drawRect(
+        rect,
+        Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2,
+      );
+      _drawLabel(
+        canvas,
+        '${detection.className} ${(detection.confidence * 100).round()}%',
+        rect.topLeft,
+        color,
+      );
+    }
+    _drawLabel(
+      canvas,
+      '${fps.toStringAsFixed(1)} fps',
+      const Offset(8, 8),
+      Colors.black54,
+    );
+  }
+
+  void _drawLabel(Canvas canvas, String text, Offset at, Color background) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: const TextStyle(color: Colors.white, fontSize: 12),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final origin = Offset(at.dx, (at.dy - painter.height).clamp(0, at.dy));
+    canvas.drawRect(origin & painter.size, Paint()..color = background);
+    painter.paint(canvas, origin);
+    painter.dispose();
+  }
+
+  @override
+  bool shouldRepaint(_BoxesPainter oldDelegate) =>
+      result != oldDelegate.result || fps != oldDelegate.fps;
 }

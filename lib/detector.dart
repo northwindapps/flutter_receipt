@@ -3,6 +3,7 @@ import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
@@ -46,6 +47,14 @@ class DetectionResult {
 
   /// The decoded photo. The caller owns it and must dispose it.
   final ui.Image image;
+  final List<Detection> detections;
+}
+
+class FrameDetections {
+  FrameDetections(this.frameSize, this.detections);
+
+  /// Size of the upright (rotated) camera frame the boxes refer to.
+  final ui.Size frameSize;
   final List<Detection> detections;
 }
 
@@ -109,33 +118,97 @@ class Detector {
     modelInput.dispose();
     final decodeMs = total.elapsedMilliseconds;
 
+    final _WorkerResult result;
+    try {
+      result = await _run(
+        _Request(_Format.rgba, [
+          TransferableTypedData.fromList([
+            rgba!.buffer.asUint8List(rgba.offsetInBytes, rgba.lengthInBytes),
+          ]),
+        ], _inputWidth, _inputHeight),
+      );
+    } catch (_) {
+      image.dispose();
+      rethrow;
+    }
+    final (boxes, preprocessMs, inferenceMs, postprocessMs) = result;
+    final detections = _toDetections(
+      boxes,
+      ui.Size(image.width.toDouble(), image.height.toDouble()),
+    );
+
+    debugPrint(
+      'Detection: decode $decodeMs ms, preprocess $preprocessMs ms, '
+      'inference $inferenceMs ms, postprocess $postprocessMs ms, '
+      'total ${total.elapsedMilliseconds} ms, '
+      '${detections.length} found ${image.width}x${image.height}',
+    );
+    return DetectionResult(image, detections);
+  }
+
+  /// Detects objects in a camera stream frame. [rotation] is the clockwise
+  /// rotation in degrees that makes the frame upright.
+  ///
+  /// The frame's bytes are copied before this method first awaits, so the
+  /// caller may let the camera reuse the buffer right after calling it.
+  Future<FrameDetections> detectFrame(CameraImage frame, int rotation) async {
+    final _Request request;
+    switch (frame.format.group) {
+      case ImageFormatGroup.yuv420 when frame.planes.length == 3:
+        request = _Request(
+          _Format.yuv420,
+          [
+            for (final plane in frame.planes)
+              TransferableTypedData.fromList([plane.bytes]),
+          ],
+          frame.width,
+          frame.height,
+          rowStride: frame.planes[0].bytesPerRow,
+          uvRowStride: frame.planes[1].bytesPerRow,
+          uvPixelStride: frame.planes[1].bytesPerPixel ?? 1,
+          rotation: rotation,
+        );
+      case ImageFormatGroup.bgra8888:
+        request = _Request(
+          _Format.bgra8888,
+          [TransferableTypedData.fromList([frame.planes[0].bytes])],
+          frame.width,
+          frame.height,
+          rowStride: frame.planes[0].bytesPerRow,
+          rotation: rotation,
+        );
+      default:
+        throw UnsupportedError(
+          'Unsupported camera frame format ${frame.format.group}',
+        );
+    }
+
+    final (boxes, _, _, _) = await _run(request);
+    final upright =
+        rotation % 180 == 0
+            ? ui.Size(frame.width.toDouble(), frame.height.toDouble())
+            : ui.Size(frame.height.toDouble(), frame.width.toDouble());
+    return FrameDetections(upright, _toDetections(boxes, upright));
+  }
+
+  Future<_WorkerResult> _run(_Request request) async {
     final reply = ReceivePort();
-    _worker.send((
-      TransferableTypedData.fromList([
-        rgba!.buffer.asUint8List(rgba.offsetInBytes, rgba.lengthInBytes),
-      ]),
-      reply.sendPort,
-    ));
+    _worker.send((request, reply.sendPort));
     final message = await reply.first;
     reply.close();
+    if (message is String) throw Exception('Detection failed: $message');
+    return message as _WorkerResult;
+  }
 
-    if (message is String) {
-      image.dispose();
-      throw Exception('Detection failed: $message');
-    }
-    final (boxes, preprocessMs, inferenceMs, postprocessMs) =
-        message as (Float32List, int, int, int);
-
+  static List<Detection> _toDetections(Float32List boxes, ui.Size size) {
     final detections = <Detection>[];
     for (var i = 0; i < boxes.length; i += _fieldsPerDetection) {
       final box = ui.Rect.fromLTRB(
-        boxes[i + 2] * image.width,
-        boxes[i + 3] * image.height,
-        boxes[i + 4] * image.width,
-        boxes[i + 5] * image.height,
-      ).intersect(
-        ui.Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
-      );
+        boxes[i + 2] * size.width,
+        boxes[i + 3] * size.height,
+        boxes[i + 4] * size.width,
+        boxes[i + 5] * size.height,
+      ).intersect(ui.Offset.zero & size);
       if (box.width < 1 || box.height < 1) continue;
       detections.add(
         Detection(
@@ -145,14 +218,7 @@ class Detector {
         ),
       );
     }
-
-    debugPrint(
-      'Detection: decode $decodeMs ms, preprocess $preprocessMs ms, '
-      'inference $inferenceMs ms, postprocess $postprocessMs ms, '
-      'total ${total.elapsedMilliseconds} ms, '
-      '${detections.length} found ${image.width}x${image.height}',
-    );
-    return DetectionResult(image, detections);
+    return detections;
   }
 
   void dispose() {
@@ -175,6 +241,35 @@ class Detector {
     return frame.image;
   }
 }
+
+enum _Format { rgba, yuv420, bgra8888 }
+
+/// Pixels sent to the worker. `rgba` is already resized to the model input;
+/// camera frames are converted, rotated and resized in the worker.
+class _Request {
+  _Request(
+    this.format,
+    this.planes,
+    this.width,
+    this.height, {
+    this.rowStride = 0,
+    this.uvRowStride = 0,
+    this.uvPixelStride = 0,
+    this.rotation = 0,
+  });
+
+  final _Format format;
+  final List<TransferableTypedData> planes;
+  final int width;
+  final int height;
+  final int rowStride;
+  final int uvRowStride;
+  final int uvPixelStride;
+  final int rotation;
+}
+
+/// Detections, then preprocess, inference and postprocess times in ms.
+typedef _WorkerResult = (Float32List, int, int, int);
 
 void _workerMain((SendPort, TransferableTypedData, double, double) args) {
   final (ready, modelData, confidenceThreshold, iouThreshold) = args;
@@ -203,15 +298,10 @@ void _workerMain((SendPort, TransferableTypedData, double, double) args) {
       requests.close();
       return;
     }
-    final (data, reply) = message as (TransferableTypedData, SendPort);
+    final (request, reply) = message as (_Request, SendPort);
     try {
       final stopwatch = Stopwatch()..start();
-      final rgba = data.materialize().asUint8List();
-      for (var p = 0, i = 0; p < rgba.length; p += 4) {
-        input[i++] = rgba[p] / 255.0;
-        input[i++] = rgba[p + 1] / 255.0;
-        input[i++] = rgba[p + 2] / 255.0;
-      }
+      _fillInput(request, input, inputShape[2], inputShape[1]);
       // Write straight into the tensor's memory instead of nested lists.
       interpreter.getInputTensor(0).data = input.buffer.asUint8List();
       final preprocessMs = stopwatch.elapsedMilliseconds;
@@ -243,6 +333,72 @@ void _workerMain((SendPort, TransferableTypedData, double, double) args) {
       reply.send('$e\n$stackTrace');
     }
   });
+}
+
+/// Writes [request]'s pixels into [input] as normalized RGB floats of size
+/// [outWidth] x [outHeight], rotating and resizing camera frames on the way.
+void _fillInput(_Request request, Float32List input, int outWidth, int outHeight) {
+  final planes = [for (final p in request.planes) p.materialize().asUint8List()];
+
+  if (request.format == _Format.rgba) {
+    final rgba = planes[0];
+    for (var p = 0, i = 0; p < rgba.length; p += 4) {
+      input[i++] = rgba[p] / 255.0;
+      input[i++] = rgba[p + 1] / 255.0;
+      input[i++] = rgba[p + 2] / 255.0;
+    }
+    return;
+  }
+
+  final w = request.width;
+  final h = request.height;
+  final rotation = request.rotation % 360;
+  final uprightWidth = rotation % 180 == 0 ? w : h;
+  final uprightHeight = rotation % 180 == 0 ? h : w;
+
+  var i = 0;
+  for (var oy = 0; oy < outHeight; oy++) {
+    final uy = oy * uprightHeight ~/ outHeight;
+    for (var ox = 0; ox < outWidth; ox++) {
+      final ux = ox * uprightWidth ~/ outWidth;
+      // Map the upright pixel back to the sensor-oriented frame.
+      final int sx, sy;
+      switch (rotation) {
+        case 90:
+          sx = uy;
+          sy = h - 1 - ux;
+        case 180:
+          sx = w - 1 - ux;
+          sy = h - 1 - uy;
+        case 270:
+          sx = w - 1 - uy;
+          sy = ux;
+        default:
+          sx = ux;
+          sy = uy;
+      }
+
+      double r, g, b;
+      if (request.format == _Format.yuv420) {
+        final y = planes[0][sy * request.rowStride + sx];
+        final uvIndex =
+            (sy >> 1) * request.uvRowStride + (sx >> 1) * request.uvPixelStride;
+        final u = planes[1][uvIndex] - 128;
+        final v = planes[2][uvIndex] - 128;
+        r = y + 1.402 * v;
+        g = y - 0.344136 * u - 0.714136 * v;
+        b = y + 1.772 * u;
+      } else {
+        final p = sy * request.rowStride + sx * 4;
+        b = planes[0][p].toDouble();
+        g = planes[0][p + 1].toDouble();
+        r = planes[0][p + 2].toDouble();
+      }
+      input[i++] = r.clamp(0, 255) / 255.0;
+      input[i++] = g.clamp(0, 255) / 255.0;
+      input[i++] = b.clamp(0, 255) / 255.0;
+    }
+  }
 }
 
 Interpreter _createInterpreter(Uint8List model) {
