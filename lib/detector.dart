@@ -8,10 +8,28 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
-const _modelAsset = 'yolo11n_saved_model/best_float32.tflite';
+const _modelAsset = 'models/cord_yolo11n.tflite';
 
-// Class names from the Ultralytics metadata embedded in the model file.
-const detectionLabels = ['datechar', 'datesla', 'item', 'itemv', 'totals', 'tv'];
+// CORD-v2 categories, in the class order of training/cord_to_yolo.py.
+const detectionLabels = [
+  'menu.nm',
+  'menu.cnt',
+  'menu.price',
+  'menu.unitprice',
+  'menu.discountprice',
+  'menu.num',
+  'menu.sub.nm',
+  'menu.sub.cnt',
+  'menu.sub.price',
+  'sub_total.subtotal_price',
+  'sub_total.tax_price',
+  'sub_total.service_price',
+  'total.total_price',
+  'total.cashprice',
+  'total.changeprice',
+  'total.creditcardprice',
+  'total.menuqty_cnt',
+];
 
 // The worker keeps boxes down to this confidence, so live tracking can keep
 // showing a box whose score dips for a frame. Callers apply their own cut-off.
@@ -275,12 +293,16 @@ void _workerMain((SendPort, TransferableTypedData, double) args) {
     return;
   }
 
-  final inputShape = interpreter.getInputTensor(0).shape; // [1, h, w, 3]
+  // [1, h, w, 3] from the TFLite exporter, [1, 3, h, w] from the LiteRT one.
+  final inputShape = interpreter.getInputTensor(0).shape;
+  final channelsFirst = inputShape[1] == 3 && inputShape[3] != 3;
+  final inputHeight = channelsFirst ? inputShape[2] : inputShape[1];
+  final inputWidth = channelsFirst ? inputShape[3] : inputShape[2];
   final outputShape = interpreter.getOutputTensor(0).shape; // [1, 4 + classes, anchors]
-  final input = Float32List(inputShape[1] * inputShape[2] * 3);
+  final input = Float32List(inputWidth * inputHeight * 3);
 
   final requests = ReceivePort();
-  ready.send((requests.sendPort, inputShape[2], inputShape[1]));
+  ready.send((requests.sendPort, inputWidth, inputHeight));
 
   requests.listen((message) {
     if (message == null) {
@@ -294,8 +316,9 @@ void _workerMain((SendPort, TransferableTypedData, double) args) {
       final letterbox = _fillInput(
         request,
         input,
-        inputShape[2],
-        inputShape[1],
+        inputWidth,
+        inputHeight,
+        channelsFirst,
       );
       // Write straight into the tensor's memory instead of nested lists.
       interpreter.getInputTensor(0).data = input.buffer.asUint8List();
@@ -315,6 +338,8 @@ void _workerMain((SendPort, TransferableTypedData, double) args) {
         output,
         outputShape[1],
         outputShape[2],
+        inputWidth,
+        inputHeight,
         minWorkerConfidence,
         iouThreshold,
       );
@@ -361,11 +386,13 @@ class _Letterbox {
 /// Writes [request]'s pixels into [input] as normalized RGB floats of size
 /// [outWidth] x [outHeight]: rotated upright, scaled to fit while keeping the
 /// aspect ratio, and padded with gray, like Ultralytics' letterbox.
+/// [channelsFirst] writes planar RRR..GGG..BBB instead of interleaved RGB.
 _Letterbox _fillInput(
   _Request request,
   Float32List input,
   int outWidth,
   int outHeight,
+  bool channelsFirst,
 ) {
   final planes = [for (final p in request.planes) p.materialize().asUint8List()];
   final w = request.width;
@@ -381,9 +408,14 @@ _Letterbox _fillInput(
   final padY = (outHeight - scaledHeight) ~/ 2;
   input.fillRange(0, input.length, 114 / 255.0);
 
+  // Offsets between a pixel's R, G and B values, and from one pixel to the next.
+  final planeSize = outWidth * outHeight;
+  final channelStep = channelsFirst ? planeSize : 1;
+  final pixelStep = channelsFirst ? 1 : 3;
+
   for (var oy = 0; oy < scaledHeight; oy++) {
     final uy = math.min(uprightHeight - 1, (oy / scale).floor());
-    var i = ((oy + padY) * outWidth + padX) * 3;
+    var i = ((oy + padY) * outWidth + padX) * pixelStep;
     for (var ox = 0; ox < scaledWidth; ox++) {
       final ux = math.min(uprightWidth - 1, (ox / scale).floor());
       // Map the upright pixel back to the source's orientation.
@@ -426,9 +458,10 @@ _Letterbox _fillInput(
           g = planes[0][p + 1].toDouble();
           b = planes[0][p + 2].toDouble();
       }
-      input[i++] = r.clamp(0, 255) / 255.0;
-      input[i++] = g.clamp(0, 255) / 255.0;
-      input[i++] = b.clamp(0, 255) / 255.0;
+      input[i] = r.clamp(0, 255) / 255.0;
+      input[i + channelStep] = g.clamp(0, 255) / 255.0;
+      input[i + 2 * channelStep] = b.clamp(0, 255) / 255.0;
+      i += pixelStep;
     }
   }
   return _Letterbox(
@@ -466,23 +499,36 @@ Interpreter _createInterpreter(Uint8List model) {
 }
 
 /// Decodes a YOLOv8/YOLO11 output laid out as [4 + classes][anchors], where the
-/// first 4 rows are normalized center x, center y, width and height, then
-/// applies per-class non-max suppression.
+/// first 4 rows are center x, center y, width and height, then applies
+/// per-class non-max suppression. Returned boxes are normalized to 0-1.
 Float32List _decodeYolo(
   Float32List output,
   int rows,
   int anchors,
+  int inputWidth,
+  int inputHeight,
   double confidenceThreshold,
   double iouThreshold,
 ) {
   final numClasses = rows - 4;
+
+  // The TFLite exporter emits normalized boxes; other exporters may emit
+  // input pixels. Centers beyond 1.5 can only be pixels, so scale those down.
+  var maxCenter = 0.0;
+  for (var i = 0; i < 2 * anchors; i++) {
+    if (output[i] > maxCenter) maxCenter = output[i];
+  }
+  // (The output is a read-only view of the tensor, so scale on read.)
+  final xScale = maxCenter > 1.5 ? 1 / inputWidth : 1.0;
+  final yScale = maxCenter > 1.5 ? 1 / inputHeight : 1.0;
+
   final candidates = <int>[];
   final classes = Int32List(anchors);
   final scores = Float32List(anchors);
 
   for (var i = 0; i < anchors; i++) {
-    final w = output[2 * anchors + i];
-    final h = output[3 * anchors + i];
+    final w = output[2 * anchors + i] * xScale;
+    final h = output[3 * anchors + i] * yScale;
     if (w < 0.01 || h < 0.01) continue;
 
     var bestScore = 0.0;
@@ -503,10 +549,10 @@ Float32List _decodeYolo(
   candidates.sort((a, b) => scores[b].compareTo(scores[a]));
 
   ui.Rect boxAt(int i) {
-    final cx = output[i];
-    final cy = output[anchors + i];
-    final w = output[2 * anchors + i];
-    final h = output[3 * anchors + i];
+    final cx = output[i] * xScale;
+    final cy = output[anchors + i] * yScale;
+    final w = output[2 * anchors + i] * xScale;
+    final h = output[3 * anchors + i] * yScale;
     return ui.Rect.fromLTWH(cx - w / 2, cy - h / 2, w, h);
   }
 

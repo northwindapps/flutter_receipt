@@ -68,6 +68,7 @@ flutter:
 
   # To add assets to your application, add an assets section, like this:
   assets:
+    - models/cord_yolo11n.tflite
     - yolo11n_saved_model/best_float16.tflite
     - yolo11n_saved_model/best_float32.tflite
     - yolo11n_saved_model/assets/
