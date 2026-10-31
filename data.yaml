@@ -1,0 +1,13 @@
+path: /Users/yano/Documents/flutter_receipt-1
+train: .
+val: .
+names:
+  0: datechar
+  1: datesla
+  2: item
+  3: itemv
+  4: totals
+  5: tv
+  6: tip
+  7: subtotal
+  8: tax

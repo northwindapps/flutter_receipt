@@ -1,0 +1,9 @@
+datechar
+datesla
+item
+itemv
+totals
+tv
+tip
+subtotal
+tax
